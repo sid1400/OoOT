@@ -1,61 +1,7 @@
-module decoder #(
-    parameter AW = 5,
-    parameter OW = 32
-) (
-    input  [AW-1:0] addr,
-    output [OW-1:0] onehot
-);
-    genvar k;
-    generate
-        for (k = 0; k < OW; k = k + 1) begin : g_bit
-            assign onehot[k] = (addr == k);
-        end
-    endgenerate
-endmodule
-
-module btree_or_bit #(
-    parameter N = 2
-) (
-    input  [N-1:0] in,
-    output         out
-);
-    generate
-        if (N == 1) begin
-            assign out = in[0];
-        end else begin
-            localparam NL = (N + 1) / 2;
-            localparam NR = N - NL;
-            wire left, right;
-            btree_or_bit #(.N(NL)) u_left  (.in(in[NL-1:0]), .out(left));
-            btree_or_bit #(.N(NR)) u_right (.in(in[N-1:NL]), .out(right));
-            assign out = left | right;
-        end
-    endgenerate
-endmodule
-
-
-module btree_or_word #(
-    parameter N = 2,
-    parameter W = 32
-) (
-    input  [N*W-1:0] in,
-    output [W-1:0]   out
-);
-    generate
-        if (N == 1) begin
-            assign out = in[W-1:0];
-        end else begin
-            localparam NL = (N + 1) / 2;
-            localparam NR = N - NL;
-            wire [W-1:0] left, right;
-            btree_or_word #(.N(NL), .W(W)) u_left  (.in(in[0  +: NL*W]),  .out(left));
-            btree_or_word #(.N(NR), .W(W)) u_right (.in(in[NL*W +: NR*W]), .out(right));
-            assign out = left | right;
-        end
-    endgenerate
-endmodule
-
-
+//convoluted
+//`include "abstractions.v"
+// why this has tag and write biforcations..... Ik it makes sense, but kills generallity...
+/*
 module regs #(
     parameter RP   = 2,
     parameter WP   = 2,
@@ -114,35 +60,56 @@ module regs #(
     generate
         for (gi = 0; gi < 32; gi = gi + 1) begin : g_reg
 
+            // ---------------- Write data port, priority-resolved ----------------
+            // w_match[gj]     : raw "port gj addresses register gi and is enabled"
+            // w_match_pri[gj] : same, but forced low if any *earlier* port (lower gj)
+            //                   also matched this cycle -> lowest port index wins.
             wire [WP-1:0]    w_match;
+            wire [WP-1:0]    w_match_pri;
             wire [32*WP-1:0] w_masked;
 
             for (gj = 0; gj < WP; gj = gj + 1) begin : g_wmatch
                 assign w_match[gj] = w_onehot[gj*32 + gi] & w_en[gj];
-                assign w_masked[gj*32 +: 32] = w_data[gj*32 +: 32] & {32{w_match[gj]}};
+
+                if (gj == 0) begin : g_wpri0
+                    assign w_match_pri[gj] = w_match[gj];
+                end else begin : g_wpriN
+                    assign w_match_pri[gj] = w_match[gj] & ~(|w_match[gj-1:0]);
+                end
+
+                assign w_masked[gj*32 +: 32] = w_data[gj*32 +: 32] & {32{w_match_pri[gj]}};
             end
 
+            // ---------------- Tag/valid write port, priority-resolved ----------------
             wire [TP-1:0]      t_match;
+            wire [TP-1:0]      t_match_pri;
             wire [TAGL*TP-1:0] t_tag_masked;
             wire [TP-1:0]      t_valid_masked;
 
             for (gj = 0; gj < TP; gj = gj + 1) begin : g_tmatch
                 assign t_match[gj] = t_onehot[gj*32 + gi] & t_en[gj];
-                assign t_tag_masked[gj*TAGL +: TAGL] = t_tag[gj*TAGL +: TAGL] & {TAGL{t_match[gj]}};
-                assign t_valid_masked[gj] = t_valid[gj] & t_match[gj];
+
+                if (gj == 0) begin : g_tpri0
+                    assign t_match_pri[gj] = t_match[gj];
+                end else begin : g_tpriN
+                    assign t_match_pri[gj] = t_match[gj] & ~(|t_match[gj-1:0]);
+                end
+
+                assign t_tag_masked[gj*TAGL +: TAGL] = t_tag[gj*TAGL +: TAGL] & {TAGL{t_match_pri[gj]}};
+                assign t_valid_masked[gj] = t_valid[gj] & t_match_pri[gj];
             end
 
             wire w_en_final;
             wire [31:0] w_data_final;
-            btree_or_bit  #(.N(WP))         u_wen_tree   (.in(w_match),  .out(w_en_final));
-            btree_or_word #(.N(WP), .W(32)) u_wdata_tree (.in(w_masked), .out(w_data_final));
+            btree_or_bit  #(.N(WP))         u_wen_tree   (.in(w_match_pri), .out(w_en_final));
+            btree_or_word #(.N(WP), .W(32)) u_wdata_tree (.in(w_masked),    .out(w_data_final));
 
             wire t_en_final;
             wire t_valid_final;
             wire [TAGL-1:0] t_tag_final;
-            btree_or_bit  #(.N(TP))           u_ten_tree    (.in(t_match),        .out(t_en_final));
-            btree_or_bit  #(.N(TP))           u_tvalid_tree (.in(t_valid_masked), .out(t_valid_final));
-            btree_or_word #(.N(TP), .W(TAGL)) u_ttag_tree   (.in(t_tag_masked),   .out(t_tag_final));
+            btree_or_bit  #(.N(TP))           u_ten_tree    (.in(t_match_pri),     .out(t_en_final));
+            btree_or_bit  #(.N(TP))           u_tvalid_tree (.in(t_valid_masked),  .out(t_valid_final));
+            btree_or_word #(.N(TP), .W(TAGL)) u_ttag_tree   (.in(t_tag_masked),    .out(t_tag_final));
 
             always @(posedge clk or posedge rst) begin
                 if (rst) begin
@@ -171,3 +138,4 @@ module regs #(
     endgenerate
 
 endmodule
+*/

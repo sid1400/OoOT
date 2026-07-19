@@ -58,235 +58,94 @@ module alu (
 
 endmodule
 
-
-module rv32m_mul_pipe (
+module mul_unit #(
+    parameter LAT = 4   // total cycles of latency from start to done
+) (
     input clk,
     input rst,
-    input [3:0] start,
 
-    input  [31:0] a0,
-    input  [31:0] b0,
-    input  [2:0]  op0,
+    input        start,
+    input [31:0] a,
+    input [31:0] b,
+    input [2:0]  op,
 
-    input  [31:0] a1,
-    input  [31:0] b1,
-    input  [2:0]  op1,
-
-    input  [31:0] a2,
-    input  [31:0] b2,
-    input  [2:0]  op2,
-
-    input  [31:0] a3,
-    input  [31:0] b3,
-    input  [2:0]  op3,
-
-
-    output reg [3:0] busy,
-    output reg [3:0] done,
-
-    output reg [31:0] result0,
-    output reg [31:0] result1,
-    output reg [31:0] result2,
-    output reg [31:0] result3
+    output reg        busy,
+    output reg        done,
+    output reg [31:0] result
 );
 
+    localparam MUL    = 3'd0;
+    localparam MULH   = 3'd1;
+    localparam MULHSU = 3'd2;
+    localparam MULHU  = 3'd3;
 
-localparam MUL    = 3'd0;
-localparam MULH   = 3'd1;
-localparam MULHSU = 3'd2;
-localparam MULHU  = 3'd3;
+    // Accept a new op only when idle
+    wire accept = start & ~busy;
 
-
-// Pipeline registers
-reg valid0,valid1,valid2,valid3;
-reg [1:0] tag0,tag1,tag2,tag3;
-reg [2:0] op_pipe0,op_pipe1,op_pipe2,op_pipe3;
-reg [63:0] prod0,prod1,prod2,prod3;
-// Input selection
-
-reg selected;
-reg [1:0] selected_tag;
-reg [31:0] selected_a;
-reg [31:0] selected_b;
-reg [2:0] selected_op;
-
-always @(*) begin
-    selected = 0;
-    selected_tag = 0;
-    selected_a = 0;
-    selected_b = 0;
-    selected_op = 0;
-    if(start[0] && !busy[0]) begin
-        selected = 1;
-        selected_tag = 0;
-        selected_a = a0;
-        selected_b = b0;
-        selected_op = op0;
-    end
-    else if(start[1] && !busy[1]) begin
-        selected = 1;
-        selected_tag = 1;
-        selected_a = a1;
-        selected_b = b1;
-        selected_op = op1;
-    end
-    else if(start[2] && !busy[2]) begin
-        selected = 1;
-        selected_tag = 2;
-        selected_a = a2;
-        selected_b = b2;
-        selected_op = op2;
-    end
-    else if(start[3] && !busy[3]) begin
-        selected = 1;
-        selected_tag = 3;
-        selected_a = a3;
-        selected_b = b3;
-        selected_op = op3;
+    // Combinational product for whatever op is currently at the input
+    reg [63:0] prod_next;
+    always @(*) begin
+        case (op)
+            MUL:     prod_next = a * b;
+            MULH:    prod_next = $signed(a)   * $signed(b);
+            MULHSU:  prod_next = $signed(a)   * $unsigned(b);
+            MULHU:   prod_next = $unsigned(a) * $unsigned(b);
+            default: prod_next = 64'd0;
+        endcase
     end
 
-end
+    // Shift registers just to burn LAT cycles before the result appears
+    reg [LAT-1:0] valid_sr;
+    reg [63:0]    prod_sr [0:LAT-1];
+    reg [2:0]     op_sr   [0:LAT-1];
 
-always @(posedge clk or posedge rst) begin
-    if(rst) begin
-        valid0 <= 0;
-        valid1 <= 0;
-        valid2 <= 0;
-        valid3 <= 0;
+    integer i;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            valid_sr <= {LAT{1'b0}};
+            busy     <= 1'b0;
+            done     <= 1'b0;
+            result   <= 32'd0;
+            for (i = 0; i < LAT; i = i + 1) begin
+                prod_sr[i] <= 64'd0;
+                op_sr[i]   <= 3'd0;
+            end
+        end else begin
 
-        busy <= 0;
-        done <= 0;
+            // shift the delay line down by one
+            for (i = LAT-1; i > 0; i = i - 1) begin
+                valid_sr[i] <= valid_sr[i-1];
+                prod_sr[i]  <= prod_sr[i-1];
+                op_sr[i]    <= op_sr[i-1];
+            end
 
-        result0 <= 0;
-        result1 <= 0;
-        result2 <= 0;
-        result3 <= 0;
+            // insert new op at the head of the delay line
+            valid_sr[0] <= accept;
+            if (accept) begin
+                prod_sr[0] <= prod_next;
+                op_sr[0]   <= op;
+            end
 
-    end
+            // busy while an op is in flight
+            if (accept)
+                busy <= 1'b1;
+            else if (valid_sr[LAT-1])
+                busy <= 1'b0;
 
-    else begin
-
-
-        done <= 0;
-
-
-        //==================================
-        // Stage 3 output
-        //==================================
-
-        if(valid3) begin
-
-            done[tag3] <= 1'b1;
-            busy[tag3] <= 1'b0;
-
-
-            case(op_pipe3)
-
-                MUL:
-                    case(tag3)
-                        0: result0 <= prod3[31:0];
-                        1: result1 <= prod3[31:0];
-                        2: result2 <= prod3[31:0];
-                        3: result3 <= prod3[31:0];
-                    endcase
-
-
-                MULH,MULHSU,MULHU:
-                    case(tag3)
-                        0: result0 <= prod3[63:32];
-                        1: result1 <= prod3[63:32];
-                        2: result2 <= prod3[63:32];
-                        3: result3 <= prod3[63:32];
-                    endcase
-
-            endcase
+            // output stage: fires exactly LAT cycles after accept
+            done <= valid_sr[LAT-1];
+            if (valid_sr[LAT-1]) begin
+                case (op_sr[LAT-1])
+                    MUL:                  result <= prod_sr[LAT-1][31:0];
+                    MULH, MULHSU, MULHU:  result <= prod_sr[LAT-1][63:32];
+                endcase
+            end
 
         end
-
-
-
-        //==================================
-        // Shift pipeline
-        //==================================
-
-        valid3 <= valid2;
-        valid2 <= valid1;
-        valid1 <= valid0;
-
-
-        tag3 <= tag2;
-        tag2 <= tag1;
-        tag1 <= tag0;
-
-
-        op_pipe3 <= op_pipe2;
-        op_pipe2 <= op_pipe1;
-        op_pipe1 <= op_pipe0;
-
-
-        prod3 <= prod2;
-        prod2 <= prod1;
-        prod1 <= prod0;
-
-
-
-        //==================================
-        // New multiplication
-        //==================================
-
-        valid0 <= selected;
-
-
-        if(selected) begin
-
-            tag0 <= selected_tag;
-
-            op_pipe0 <= selected_op;
-
-
-            case(selected_op)
-
-                MUL:
-                    prod0 <= selected_a * selected_b;
-
-
-                MULH:
-                    prod0 <=
-                    $signed(selected_a) *
-                    $signed(selected_b);
-
-
-                MULHSU:
-                    prod0 <=
-                    $signed(selected_a) *
-                    $unsigned(selected_b);
-
-
-                MULHU:
-                    prod0 <=
-                    $unsigned(selected_a) *
-                    $unsigned(selected_b);
-
-
-                default:
-                    prod0 <= 0;
-
-            endcase
-
-
-            busy[selected_tag] <= 1'b1;
-
-        end
-
-
     end
-
-end
-
 
 endmodule
-
-
+    
 module rv32m_div (
 
     input clk,
