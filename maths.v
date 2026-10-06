@@ -1,427 +1,301 @@
-`timescale 1ns/1ps
-
-module alu (
-    input  [31:0] a,
-    input  [31:0] b,
-    input  [3:0]  alu_op,
-    input start,
-    input clk,
-
-    output reg [31:0] result,
-    output done
-    output busy
-);
-
-    // ALU operation encoding
-    localparam ALU_ADD  = 4'd0;
-    localparam ALU_SUB  = 4'd1;
-    localparam ALU_SLL  = 4'd2;
-    localparam ALU_SLT  = 4'd3;
-    localparam ALU_SLTU = 4'd4;
-    localparam ALU_XOR  = 4'd5;
-    localparam ALU_SRL  = 4'd6;
-    localparam ALU_SRA  = 4'd7;
-    localparam ALU_OR   = 4'd8;
-    localparam ALU_AND  = 4'd9;
-
-    assign busy = 0;
-    always @(posedge clk) begin
-        done <= start;
-    end
-
-    always @(*) begin
-        case (alu_op)
-            ALU_ADD:
-                result = a + b;
-            ALU_SUB:
-                result = a - b;
-            ALU_SLL:
-                result = a << b[4:0];
-            ALU_SLT:
-                result = ($signed(a) < $signed(b)) ? 32'd1 : 32'd0;
-            ALU_SLTU:
-                result = (a < b) ? 32'd1 : 32'd0;
-            ALU_XOR:
-                result = a ^ b;
-            ALU_SRL:
-                result = a >> b[4:0];
-            ALU_SRA:
-                result = $signed(a) >>> b[4:0];
-            ALU_OR:
-                result = a | b;
-            ALU_AND:
-                result = a & b;
-            default:
-                result = 32'b0;
-        endcase
-    end
-
-endmodule
-
-module mul_unit #(
-    parameter LAT = 4   // total cycles of latency from start to done
-) (
+module alu #(
+    parameter TAGL = 6,
+    parameter OPW  = 17,
+    parameter DW   = 32,
+    parameter IMMW = 21
+)(
     input clk,
     input rst,
 
-    input        start,
-    input [31:0] a,
-    input [31:0] b,
-    input [2:0]  op,
+    input                  in_valid,
+    output                 in_ready,
+    input  [OPW-1:0]       opcode,
+    input  [DW-1:0]        src1_value,
+    input  [DW-1:0]        src2_value,
+    input  [TAGL-1:0]      dest_tag,
+    input  [IMMW-1:0]      imm,
 
-    output reg        busy,
-    output reg        done,
-    output reg [31:0] result
+    output                 wb_valid,
+    input                  wb_ready,
+    output [TAGL-1:0]      wb_dest_tag,
+    output [DW-1:0]        wb_data,
+
+    input                  kill_i,
+    input  [TAGL-1:0]      kill_head_i,
+    input  [TAGL-1:0]      kill_tail_i
 );
 
-    localparam MUL    = 3'd0;
-    localparam MULH   = 3'd1;
-    localparam MULHSU = 3'd2;
-    localparam MULHU  = 3'd3;
+    function in_range;
+        input [TAGL-1:0] idx, hd, tl;
+        begin
+            if (hd <= tl)
+                in_range = (idx >= hd) && (idx < tl);
+            else
+                in_range = (idx >= hd) || (idx < tl);
+        end
+    endfunction
 
-    // Accept a new op only when idle
-    wire accept = start & ~busy;
+    wire [6:0] real_opcode = opcode[6:0];
+    wire [2:0] funct3      = opcode[9:7];
+    wire       funct7_5    = opcode[15];
+    wire       is_reg      = real_opcode[5];
 
-    // Combinational product for whatever op is currently at the input
+    wire [DW-1:0] sext_imm = {{(DW-IMMW){imm[IMMW-1]}}, imm};
+    wire [DW-1:0] operand2 = is_reg ? src2_value : sext_imm;
+
+    wire sub = is_reg & funct7_5 & (funct3 == 3'b000);
+    wire sra = funct7_5 & (funct3 == 3'b101);
+
+    reg [DW-1:0] alu_result;
+    always @(*) begin
+        case (funct3)
+            3'b000:  alu_result = sub ? (src1_value - operand2) : (src1_value + operand2);
+            3'b001:  alu_result = src1_value << operand2[4:0];
+            3'b010:  alu_result = ($signed(src1_value) < $signed(operand2)) ? {{(DW-1){1'b0}}, 1'b1} : {DW{1'b0}};
+            3'b011:  alu_result = (src1_value < operand2) ? {{(DW-1){1'b0}}, 1'b1} : {DW{1'b0}};
+            3'b100:  alu_result = src1_value ^ operand2;
+            3'b101:  alu_result = sra ? ($signed(src1_value) >>> operand2[4:0]) : (src1_value >> operand2[4:0]);
+            3'b110:  alu_result = src1_value | operand2;
+            3'b111:  alu_result = src1_value & operand2;
+            default: alu_result = {DW{1'b0}};
+        endcase
+    end
+
+    // squashed op is accepted (drained) but never written back
+    wire squash = kill_i & ~in_range(dest_tag, kill_head_i, kill_tail_i);
+
+    assign in_ready    = wb_ready | squash;
+    assign wb_valid    = in_valid & ~squash;
+    assign wb_dest_tag = dest_tag;
+    assign wb_data     = alu_result;
+
+endmodule
+
+
+module mul_unit #(
+    parameter LAT  = 4,
+    parameter TAGL = 6,
+    parameter OPW  = 17,
+    parameter DW   = 32,
+    parameter CW   = (LAT > 1) ? $clog2(LAT) : 1
+)(
+    input clk,
+    input rst,
+
+    input                  in_valid,
+    output                 in_ready,
+    input  [OPW-1:0]       opcode,
+    input  [DW-1:0]        src1_value,
+    input  [DW-1:0]        src2_value,
+    input  [TAGL-1:0]      dest_tag,
+
+    output                 wb_valid,
+    input                  wb_ready,
+    output [TAGL-1:0]      wb_dest_tag,
+    output [DW-1:0]        wb_data,
+
+    input                  kill_i,
+    input  [TAGL-1:0]      kill_head_i,
+    input  [TAGL-1:0]      kill_tail_i
+);
+
+    localparam MUL    = 2'd0;
+    localparam MULH   = 2'd1;
+    localparam MULHSU = 2'd2;
+    localparam MULHU  = 2'd3;
+
+    function in_range;
+        input [TAGL-1:0] idx, hd, tl;
+        begin
+            if (hd <= tl)
+                in_range = (idx >= hd) && (idx < tl);
+            else
+                in_range = (idx >= hd) || (idx < tl);
+        end
+    endfunction
+
+    reg busy;
+    reg hold_valid;
+    reg dead_r;
+    reg [CW-1:0]   count;
+    reg [1:0]      op_r;
+    reg [TAGL-1:0] dest_tag_r;
+    reg [63:0]     prod_r;
+    reg [DW-1:0]   result_r;
+
+    wire [1:0] mul_op = opcode[8:7];
+    assign in_ready = ~busy & ~hold_valid;
+    wire accept = in_valid & in_ready;
+
+    // crash-time range checks: incoming op, and op already in flight
+    wire sq_in   = kill_i & ~in_range(dest_tag,   kill_head_i, kill_tail_i);
+    wire sq_held = kill_i & ~in_range(dest_tag_r, kill_head_i, kill_tail_i);
+    wire drop    = hold_valid & (dead_r | sq_held);
+
+    assign wb_valid    = hold_valid & ~dead_r & ~sq_held;
+    assign wb_dest_tag = dest_tag_r;
+    assign wb_data     = result_r;
+
     reg [63:0] prod_next;
     always @(*) begin
-        case (op)
-            MUL:     prod_next = a * b;
-            MULH:    prod_next = $signed(a)   * $signed(b);
-            MULHSU:  prod_next = $signed(a)   * $unsigned(b);
-            MULHU:   prod_next = $unsigned(a) * $unsigned(b);
+        case (mul_op)
+            MUL:     prod_next = {32'd0, src1_value} * {32'd0, src2_value};
+            MULH:    prod_next = {{32{src1_value[31]}}, src1_value} * {{32{src2_value[31]}}, src2_value};
+            MULHSU:  prod_next = {{32{src1_value[31]}}, src1_value} * {32'd0, src2_value};
+            MULHU:   prod_next = {32'd0, src1_value} * {32'd0, src2_value};
             default: prod_next = 64'd0;
         endcase
     end
 
-    // Shift registers just to burn LAT cycles before the result appears
-    reg [LAT-1:0] valid_sr;
-    reg [63:0]    prod_sr [0:LAT-1];
-    reg [2:0]     op_sr   [0:LAT-1];
-
-    integer i;
     always @(posedge clk or posedge rst) begin
         if (rst) begin
-            valid_sr <= {LAT{1'b0}};
-            busy     <= 1'b0;
-            done     <= 1'b0;
-            result   <= 32'd0;
-            for (i = 0; i < LAT; i = i + 1) begin
-                prod_sr[i] <= 64'd0;
-                op_sr[i]   <= 3'd0;
-            end
+            busy       <= 1'b0;
+            hold_valid <= 1'b0;
+            dead_r     <= 1'b0;
+            count      <= {CW{1'b0}};
         end else begin
-
-            // shift the delay line down by one
-            for (i = LAT-1; i > 0; i = i - 1) begin
-                valid_sr[i] <= valid_sr[i-1];
-                prod_sr[i]  <= prod_sr[i-1];
-                op_sr[i]    <= op_sr[i-1];
-            end
-
-            // insert new op at the head of the delay line
-            valid_sr[0] <= accept;
             if (accept) begin
-                prod_sr[0] <= prod_next;
-                op_sr[0]   <= op;
+                busy       <= 1'b1;
+                op_r       <= mul_op;
+                dest_tag_r <= dest_tag;
+                prod_r     <= prod_next;
+                count      <= LAT[CW-1:0] - 1'b1;
+                dead_r     <= sq_in;
+            end else if (busy) begin
+                if (sq_held)
+                    dead_r <= 1'b1;
+                if (count == {CW{1'b0}}) begin
+                    busy       <= 1'b0;
+                    hold_valid <= 1'b1;
+                    result_r   <= (op_r == MUL) ? prod_r[31:0] : prod_r[63:32];
+                end else begin
+                    count <= count - 1'b1;
+                end
             end
 
-            // busy while an op is in flight
-            if (accept)
-                busy <= 1'b1;
-            else if (valid_sr[LAT-1])
-                busy <= 1'b0;
-
-            // output stage: fires exactly LAT cycles after accept
-            done <= valid_sr[LAT-1];
-            if (valid_sr[LAT-1]) begin
-                case (op_sr[LAT-1])
-                    MUL:                  result <= prod_sr[LAT-1][31:0];
-                    MULH, MULHSU, MULHU:  result <= prod_sr[LAT-1][63:32];
-                endcase
-            end
-
+            // released by a real transfer, or silently dropped if dead
+            if ((wb_valid & wb_ready) | drop)
+                hold_valid <= 1'b0;
         end
     end
 
 endmodule
-    
-module rv32m_div (
 
+
+module rv32m_div #(
+    parameter TAGL = 6,
+    parameter OPW  = 17,
+    parameter DW   = 32
+)(
     input clk,
     input rst,
 
-    input start,
+    input                  in_valid,
+    output                 in_ready,
+    input  [OPW-1:0]       opcode,
+    input  [DW-1:0]        src1_value,
+    input  [DW-1:0]        src2_value,
+    input  [TAGL-1:0]      dest_tag,
 
-    input [31:0] dividend,
-    input [31:0] divisor,
+    output                 wb_valid,
+    input                  wb_ready,
+    output [TAGL-1:0]      wb_dest_tag,
+    output [DW-1:0]        wb_data,
 
-    input [1:0] op,
-
-    output reg busy,
-    output reg done,
-
-    output reg [31:0] result
+    input                  kill_i,
+    input  [TAGL-1:0]      kill_head_i,
+    input  [TAGL-1:0]      kill_tail_i
 );
 
+    localparam DIV  = 2'd0;
+    localparam DIVU = 2'd1;
+    localparam REM  = 2'd2;
+    localparam REMU = 2'd3;
 
-localparam DIV  = 2'd0;
-localparam DIVU = 2'd1;
-localparam REM  = 2'd2;
-localparam REMU = 2'd3;
-
-
-reg [31:0] quotient;
-reg [32:0] remainder;
-
-reg [31:0] dividend_reg;
-reg [31:0] divisor_reg;
-
-reg [5:0] count;
-
-reg neg_a;
-reg neg_b;
-
-reg [1:0] operation;
-
-
-
-always @(posedge clk or posedge rst) begin
-
-    if(rst) begin
-        busy <= 0;
-        done <= 0;
-        result <= 0;
-
-        quotient <= 0;
-        remainder <= 0;
-
-        count <= 0;
-
-    end
-
-
-    else begin
-
-
-        done <= 0;
-
-
-
-        if(start && !busy) begin
-
-
-            operation <= op;
-
-
-            neg_a <= ((op==DIV)||(op==REM)) && dividend[31];
-            neg_b <= ((op==DIV)||(op==REM)) && divisor[31];
-
-
-            dividend_reg <=
-                (((op==DIV)||(op==REM)) &&
-                 dividend[31]) ?
-                 (~dividend+1):
-                 dividend;
-
-
-            divisor_reg <=
-                (((op==DIV)||(op==REM)) &&
-                 divisor[31]) ?
-                 (~divisor+1):
-                 divisor;
-
-
-            quotient <= 0;
-            remainder <= 0;
-
-
-            count <= 32;
-
-
-            busy <= 1;
-
-
+    function in_range;
+        input [TAGL-1:0] idx, hd, tl;
+        begin
+            if (hd <= tl)
+                in_range = (idx >= hd) && (idx < tl);
+            else
+                in_range = (idx >= hd) || (idx < tl);
         end
-
-
-
-        else if(busy) begin
-
-
-
-            remainder <=
-            {remainder[31:0],
-             dividend_reg[31]};
-
-
-            dividend_reg <=
-            {dividend_reg[30:0],1'b0};
-
-
-
-            quotient <=
-            {quotient[30:0],1'b0};
-
-
-
-            if(remainder >= divisor_reg) begin
-
-                remainder <=
-                remainder-divisor_reg;
-
-                quotient[0] <= 1'b1;
-
-            end
-
-
-
-            count <= count-1;
-
-
-
-            if(count==1) begin
-
-
-                busy <= 0;
-                done <= 1;
-
-
-                case(operation)
-
-
-                DIV:
-
-                    if(divisor_reg==0)
-                        result <= 32'hFFFFFFFF;
-
-                    else if(neg_a ^ neg_b)
-                        result <= ~quotient + 1;
-
-                    else
-                        result <= quotient;
-
-
-
-                DIVU:
-
-                    if(divisor_reg==0)
-                        result <= 32'hFFFFFFFF;
-
-                    else
-                        result <= quotient;
-
-
-
-                REM:
-
-                    if(divisor_reg==0)
-                        result <= dividend_reg;
-
-                    else if(neg_a)
-                        result <= ~remainder[31:0]+1;
-
-                    else
-                        result <= remainder[31:0];
-
-
-
-                REMU:
-
-                    if(divisor_reg==0)
-                        result <= dividend_reg;
-
-                    else
-                        result <= remainder[31:0];
-
-
-                endcase
-
-            end
-
-        end
-
-    end
-
-end
-
-
-endmodule
-
-module load_unit #(
-    parameter TAGW = 6
-) (
-    input  logic         clk,
-    input  logic         rst_n,
-
-    input  logic         disp_valid,
-    output logic         disp_ready,
-    input  logic [31:0]  disp_addr,
-    input  logic [2:0]   disp_funct3,
-    input  logic [TAGW-1:0] disp_tag,
-
-    output logic         mem_valid,
-    input  logic         mem_ready,
-    output logic [31:0]  mem_addr,
-
-    input  logic         mem_resp_valid,
-    output logic         mem_resp_ready,
-    input  logic [31:0]  mem_resp_data,
-
-    output logic         out_valid,
-    input  logic         out_ready,
-    output logic [31:0]  out_data,
-    output logic [TAGW-1:0] out_tag
-);
-
-    typedef enum logic [1:0] {IDLE, WAIT_MEM, WAIT_OUT} state_t;
-    state_t state, state_n;
-
-    logic [31:0] addr_q;
-    logic [2:0]  funct3_q;
-    logic [TAGW-1:0] tag_q;
-    logic [31:0] data_q;
-
-    assign disp_ready     = (state == IDLE);
-    assign mem_valid      = (state == WAIT_MEM);
-    assign mem_addr       = addr_q;
-    assign mem_resp_ready = (state == WAIT_MEM);
-    assign out_valid      = (state == WAIT_OUT);
-    assign out_tag        = tag_q;
-
-    always_comb begin
-        case (funct3_q)
-            3'b000: out_data = {{24{data_q[7]}},  data_q[7:0]};
-            3'b001: out_data = {{16{data_q[15]}}, data_q[15:0]};
-            3'b010: out_data = data_q;
-            3'b100: out_data = {24'b0, data_q[7:0]};
-            3'b101: out_data = {16'b0, data_q[15:0]};
-            default: out_data = data_q;
-        endcase
-    end
-
-    always_comb begin
-        state_n = state;
-        case (state)
-            IDLE:     if (disp_valid && disp_ready) state_n = WAIT_MEM;
-            WAIT_MEM: if (mem_resp_valid && mem_resp_ready) state_n = WAIT_OUT;
-            WAIT_OUT: if (out_valid && out_ready) state_n = IDLE;
-        endcase
-    end
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            state <= IDLE;
+    endfunction
+
+    reg busy;
+    reg hold_valid;
+    reg dead_r;
+    reg [1:0]      op_r;
+    reg [TAGL-1:0] dest_tag_r;
+    reg [31:0]     quotient;
+    reg [32:0]     remainder;
+    reg [31:0]     dividend_r;
+    reg [31:0]     divisor_r;
+    reg [31:0]     orig_a;      // raw dividend, for divide-by-zero REM
+    reg [5:0]      count;
+    reg            neg_a, neg_b;
+    reg [DW-1:0]   result_r;
+
+    wire [1:0] div_op = opcode[8:7];
+    wire sgn_op = (div_op == DIV) | (div_op == REM);
+    assign in_ready = ~busy & ~hold_valid;
+    wire accept = in_valid & in_ready;
+
+    wire sq_in   = kill_i & ~in_range(dest_tag,   kill_head_i, kill_tail_i);
+    wire sq_held = kill_i & ~in_range(dest_tag_r, kill_head_i, kill_tail_i);
+    wire drop    = hold_valid & (dead_r | sq_held);
+
+    assign wb_valid    = hold_valid & ~dead_r & ~sq_held;
+    assign wb_dest_tag = dest_tag_r;
+    assign wb_data     = result_r;
+
+    // one restoring-division step (shift in next dividend bit, then compare)
+    wire [32:0] rem_shift = {remainder[31:0], dividend_r[31]};
+    wire        sub_ok    = (rem_shift >= {1'b0, divisor_r});
+    wire [32:0] rem_next  = sub_ok ? (rem_shift - {1'b0, divisor_r}) : rem_shift;
+    wire [31:0] quo_next  = {quotient[30:0], sub_ok};
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            busy       <= 1'b0;
+            hold_valid <= 1'b0;
+            dead_r     <= 1'b0;
+            count      <= 6'd0;
         end else begin
-            state <= state_n;
-            if (state == IDLE && disp_valid && disp_ready) begin
-                addr_q   <= disp_addr;
-                funct3_q <= disp_funct3;
-                tag_q    <= disp_tag;
+            if (accept) begin
+                op_r       <= div_op;
+                dest_tag_r <= dest_tag;
+                orig_a     <= src1_value;
+                neg_a      <= sgn_op & src1_value[31];
+                neg_b      <= sgn_op & src2_value[31];
+                dividend_r <= (sgn_op & src1_value[31]) ? (~src1_value + 1'b1) : src1_value;
+                divisor_r  <= (sgn_op & src2_value[31]) ? (~src2_value + 1'b1) : src2_value;
+                quotient   <= 32'd0;
+                remainder  <= 33'd0;
+                count      <= 6'd32;
+                busy       <= 1'b1;
+                dead_r     <= sq_in;
+            end else if (busy) begin
+                if (sq_held)
+                    dead_r <= 1'b1;
+                remainder  <= rem_next;
+                dividend_r <= {dividend_r[30:0], 1'b0};
+                quotient   <= quo_next;
+                count      <= count - 1'b1;
+                if (count == 6'd1) begin
+                    busy       <= 1'b0;
+                    hold_valid <= 1'b1;
+                    case (op_r)
+                        DIV:  result_r <= (divisor_r == 0) ? 32'hFFFFFFFF : ((neg_a ^ neg_b) ? (~quo_next + 1'b1) : quo_next);
+                        DIVU: result_r <= (divisor_r == 0) ? 32'hFFFFFFFF : quo_next;
+                        REM:  result_r <= (divisor_r == 0) ? orig_a : (neg_a ? (~rem_next[31:0] + 1'b1) : rem_next[31:0]);
+                        REMU: result_r <= (divisor_r == 0) ? orig_a : rem_next[31:0];
+                    endcase
+                end
             end
-            if (state == WAIT_MEM && mem_resp_valid && mem_resp_ready) begin
-                data_q <= mem_resp_data;
-            end
+
+            if ((wb_valid & wb_ready) | drop)
+                hold_valid <= 1'b0;
         end
     end
 

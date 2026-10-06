@@ -15,7 +15,7 @@ endmodule
 
 module antitherm #(
     parameter PN = 4,
-    parameter CW = $clog2(PN) + 1
+    parameter CW = $clog2(PN) + 1   // just take this as upper estimate, even though the last bit wont be used for non 2 powers
 )(
     input      [PN-1:0] allow,
     input      [PN-1:0] block,

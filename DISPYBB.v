@@ -1,39 +1,5 @@
-`include "REGUNT0.v"
-// dispatcher: now owns its own instr_queue internally (see u_instr_queue
-// below), so the external pinout is the instr_queue PUSH interface
-// (valid_i/itype_i/.../ready_o) instead of the old instr_queue POP
-// interface (occ_i/itype_i/.../pop_count_o). Everything downstream of the
-// queue (SR resolution, bank routing, MULTI split, REGUNT0) is unchanged -
-// it now just reads from the queue's pop side via internal q_*_w wires
-// instead of via module input ports.
-//
-// takes PN decoded instr_buf entries per cycle (pushed through valid_i/...),
-// resolves SR1/SR2 operands against REGUNT0 (rename regfile + ROB fallback),
-// allocates ROB tags/dest renames, and issues an in-order thermometered
-// prefix of them to per-itype RS banks. MULTI (JAL/JALR) is not a normal
-// bank: when it reaches lane 0 it is split into two same-cycle micro-ops
-// (ALU save-pointer on port0, BRANCH jump on port1) with no separate FSM
-// state needed, since both fire in the same cycle.
+`include "REGUNT_NOVA0.v"
 
-// src_bypass: for each of PN query positions, checks lanes strictly above it
-// (lower index, earlier in program order within this cycle's dispatch group)
-// for a same-cycle destination-register match. Needed because the regfile's
-// stored tag for a register is only updated on the NEXT edge - if two
-// instructions in the same dispatch group write/read the same register
-// (e.g. R1=... ; R2=R1+...), the regfile read this cycle is stale for the
-// second one. On a hit, the caller must treat the source as valid=0 with
-// the matched lane's speculative tag (data isn't computed yet, only the
-// tag exists) - never as a resolved value. Reg 0 can never match since a
-// dest of 0 is masked out (reg0 is never a real write target).
-// Priority: nearest lane above wins (highest matching index below query k).
-
-
-
-
-//for whatever reason, dispatcher here has individual ready's even thought it is still
-//all or nothing
-
-//nomenclature such that earlier instr -> lower index (like [3:0] instead of [7:4])
 module src_bypass #(
     parameter PN   = 3,
     parameter REGW = 5,
@@ -83,15 +49,6 @@ module src_bypass #(
 endmodule
 
 
-// instr_queue: small circular buffer. Strict FIFO (no holes, unlike ROB), so
-// occupancy at pop offset k is just count>k - no per-slot valid bits and no
-// antitherm needed here. Push side assumes valid_i is thermometer-shaped
-// (contiguous prefix), addresses tail+k are distinct by construction so
-// writes are direct, no decoder/onehot/tree. Pop advance is driven
-// externally by pop_count_i (the dispatcher's own antitherm count, since
-// dispatch grant logic still lives in the dispatcher, not here). Kept as a
-// standalone module and instantiated inside dispatcher below, rather than
-// inlined, so it stays independently reusable/testable.
 module instr_queue #(
     parameter PN     = 3,
     parameter S      = 8,
@@ -105,7 +62,6 @@ module instr_queue #(
     input rst,
     input crash_i,
 
-    // ---------------- push side (from instr_buf) ----------------
     input  [PN-1:0]          valid_i,
     input  [PN*ITYPEW-1:0]   itype_i,
     input  [PN*OPW-1:0]      op_i,
@@ -116,7 +72,6 @@ module instr_queue #(
     input  [PN*PCW-1:0]      pc_i,
     output [PN-1:0]          ready_o,
 
-    // ---------------- pop side (to dispatch logic) ----------------
     output [PN-1:0]          occ_o,
     output [PN*ITYPEW-1:0]   itype_o,
     output [PN*OPW-1:0]      op_o,
@@ -140,7 +95,6 @@ module instr_queue #(
     assign head_ptr_o = head;
     assign tail_ptr_o = tail;
 
-    // ---------------- push accept: all-or-nothing, capacity for a full PN burst ----------------
     integer pj;
     reg [CW-1:0] n_push;
     always @(*) begin
@@ -161,7 +115,6 @@ module instr_queue #(
 
     wire [CW-1:0] n_push_eff = push_ready_w ? n_push : {CW{1'b0}};
 
-    // ---------------- pop advance: clamp to occupancy, matches self-gating convention ----------------
     wire [PTRW:0] eff_pop = (pop_count_i > count) ? count : pop_count_i;
 
     always @(posedge clk or posedge rst) begin
@@ -170,15 +123,12 @@ module instr_queue #(
             tail  <= {PTRW{1'b0}};
             count <= {(PTRW+1){1'b0}};
         end else begin
-            //head  <= head + eff_pop[PTRW-1:0];
             head  <= head + eff_pop;
-            //tail  <= tail + n_push_eff[PTRW-1:0];
             tail  <= tail + n_push_eff;
             count <= count + n_push_eff - eff_pop;
         end
     end
 
-    // ---------------- field storage: plain per-field arrays, direct-indexed ----------------
     reg [ITYPEW-1:0] itype_mem [0:S-1];
     reg [OPW-1:0]    op_mem    [0:S-1];
     reg [REGW-1:0]   reg1_mem  [0:S-1];
@@ -190,7 +140,6 @@ module instr_queue #(
     generate
         for (gp = 0; gp < PN; gp = gp + 1) begin : g_push
             wire [PTRW-1:0] push_addr = tail + gp[PTRW-1:0];
-            //wire [PTRW-1:0] push_addr = tail + gp;
             always @(posedge clk) begin
                 if (eff_push[gp]) begin
                     itype_mem[push_addr] <= itype_i[gp*ITYPEW +: ITYPEW];
@@ -205,7 +154,6 @@ module instr_queue #(
         end
     endgenerate
 
-    // ---------------- pop read: combinational, contiguous from head ----------------
     genvar gk;
     generate
         for (gk = 0; gk < PN; gk = gk + 1) begin : g_pop
@@ -223,11 +171,6 @@ module instr_queue #(
 
 endmodule
 
-// dispatcher: see header comment at top of file. External pinout is now the
-// instr_queue PUSH interface; instr_queue is instantiated internally
-// (u_instr_queue) and its POP side feeds the same SR-resolution / bank-
-// routing / MULTI-split / REGUNT0 logic that previously read directly from
-// module input ports.
 module dispatcher #(
     parameter PN      = 3,
     parameter REG_S   = 32,
@@ -247,7 +190,6 @@ module dispatcher #(
     input rst,
     input crash_i,
 
-    // ---------------- instr_queue push side (from instr_buf) ----------------
     input  [PN-1:0]           valid_i,
     input  [PN*ITYPEW-1:0]    itype_i,
     input  [PN*OPW-1:0]       op_i,
@@ -258,7 +200,6 @@ module dispatcher #(
     input  [PN*PCW-1:0]       pc_i,
     output [PN-1:0]           ready_o,
 
-    // ---------------- per-bank ready-in ----------------
     input alu_ready_i,
     input mult_ready_i,
     input div_ready_i,
@@ -267,7 +208,6 @@ module dispatcher #(
     input branch_ready_i,
     input trap_ready_i,
 
-    // ---------------- shared dispatch data bus (broadcast to all banks) ----------------
     output [PN*TAGL-1:0] src1_tag_o,
     output [PN-1:0]      src1_val_o,
     output [PN*DW-1:0]   src1_value_o,
@@ -279,7 +219,6 @@ module dispatcher #(
     output [PN*IMMW-1:0] imm_o,
     output [PN*PCW-1:0]  pc_o,
 
-    // ---------------- per-bank valid (which of the shared-bus lanes belong to that bank) ----------------
     output [PN-1:0] alu_valid_o,
     output [PN-1:0] mult_valid_o,
     output [PN-1:0] div_valid_o,
@@ -288,28 +227,19 @@ module dispatcher #(
     output [PN-1:0] branch_valid_o,
     output [PN-1:0] trap_valid_o,
 
-    // ---------------- FU writeback into ROB (pass-through to REGUNT0) ----------------
     input  [ROB_WP*TAGL-1:0] w_addr_i,
     input  [ROB_WP*DW-1:0]   w_data_i,
     input  [ROB_WP*EXPL-1:0] w_exception_i,
     input  [ROB_WP-1:0]      w_en_i,
 
-    // ---------------- crash tail (external, forwarded to REGUNT0's ROB reset) ----------------
-    // Was previously hardwired to {TAGL{1'b0}} internally, which only
-    // "worked" by coincidence when head_ptr_o also happened to be 0 (i.e.
-    // nothing had retired yet). Now a real input so the caller can supply
-    // the correct reset point for the ROB's tail on a crash (see tb: the
-    // caller snapshots head_ptr_o just before pulsing crash_i and feeds it
-    // back in here, so tail resets to head -> occupancy goes to 0 cleanly
-    // regardless of where head currently sits).
     input  [TAGL-1:0] crash_tail_i,
 
     output [TAGL-1:0] head_ptr_o,
     output [TAGL-1:0] tail_ptr_o,
+    output [PN-1:0]   commit_valid_o,
     output             o_crash,
     output [EXPL-1:0]  o_exception,
 
-    // ---------------- instr_queue visibility (debug/test only) ----------------
     output [QPTRW-1:0] q_head_ptr_o,
     output [QPTRW-1:0] q_tail_ptr_o
 );
@@ -330,11 +260,6 @@ module dispatcher #(
 
     genvar gk;
 
-    // ================= instr_queue instance =================
-    // Push side wired straight to this module's own inputs. Pop side feeds
-    // the rest of the dispatch logic below via q_*_w, exactly where that
-    // logic used to read occ_i/itype_i/op_i/reg1_i/reg2_i/dest_i/imm_i/pc_i
-    // as module input ports.
     wire [PN-1:0]           q_occ_w;
     wire [PN*ITYPEW-1:0]    q_itype_w;
     wire [PN*OPW-1:0]       q_op_w;
@@ -358,7 +283,6 @@ module dispatcher #(
         .head_ptr_o(q_head_ptr_o), .tail_ptr_o(q_tail_ptr_o)
     );
 
-    // ================= REGUNT0 instance =================
     wire [2*PN*REG_ADDR-1:0] regfile_raddr;
     wire [2*PN*DW-1:0]       regfile_rdata;
     wire [2*PN*TAGL-1:0]     regfile_rtag;
@@ -377,7 +301,7 @@ module dispatcher #(
 
     wire crash_w = o_crash;
 
-    REGUNT0 #(
+    REGUNT_NOVA0 #(
         .PN     (PN),
         .DW     (DW),
         .REG_S  (REG_S),
@@ -410,18 +334,19 @@ module dispatcher #(
         .head_ptr_o (head_ptr_o),
         .tail_ptr_o (tail_ptr_o),
         .crash_i (crash_i),
-        .crash_tail_i (crash_tail_i), // now driven externally instead of hardwired 0
-        .crash_reason_i ({CRW{1'b0}}),///////////////////////////////
-        .o_crash (o_crash),/////////////////////////////////////////
+        .crash_tail_i (crash_tail_i),
+        .crash_reason_i ({CRW{1'b0}}),
+        .o_crash (o_crash),
         .o_crash_tail (),
         .o_crash_src (),
         .o_crash_reason (),
-        .o_exception (o_exception)
+        .o_exception (o_exception),
+        .o_commit_valid (commit_valid_o),
+        .o_replay_busy ()
     );
 
     assign dest_tag_o = temp_tag_w;
 
-    // ================= intra-cycle same-group hazard bypass =================
     wire [PN-1:0]      bypass1_hit_w, bypass2_hit_w;
     wire [PN*TAGL-1:0] bypass1_tag_w, bypass2_tag_w;
 
@@ -443,7 +368,6 @@ module dispatcher #(
         .tag_o        (bypass2_tag_w)
     );
 
-    // ================= SR1/SR2 resolution (2*PN ports, port 2k=src1, 2k+1=src2) =================
     wire [PN*TAGL-1:0] s1_tag_w, s2_tag_w;
     wire [PN-1:0]      s1_val_w, s2_val_w;
     wire [PN*DW-1:0]   s1_value_w, s2_value_w;
@@ -472,7 +396,6 @@ module dispatcher #(
         end
     endgenerate
 
-    // ================= bank-ready mux per lane =================
     reg [PN-1:0] bank_ready_w;
     generate
         for (gk = 0; gk < PN; gk = gk + 1) begin : g_bready
@@ -491,7 +414,6 @@ module dispatcher #(
         end
     endgenerate
 
-    // ================= antitherm: in-order allow/block, MULTI blocks itself+behind =================
     wire [PN-1:0] raw_allow_w, block_w;
     generate
         for (gk = 0; gk < PN; gk = gk + 1) begin : g_ab
@@ -523,13 +445,11 @@ module dispatcher #(
         end
     endgenerate
 
-    // ================= MULTI same-cycle split, only meaningful when it sits at lane 0 =================
     wire multi_fire_w = q_occ_w[0] & (q_itype_w[0*ITYPEW +: ITYPEW] == ITYPE_MULTI)
                        & alu_ready_i & branch_ready_i & regunt_ready_w & ~crash_w;
 
     wire [OPW-1:0] add_op_const = {7'b0000000, 3'b000, 7'b0110011};
 
-    // ---- port 0 (ALU save-pointer micro-op: dest = PC + PC_INCR, or normal lane0 dispatch) ----
     assign src1_tag_o[0*TAGL +: TAGL]   = multi_fire_w ? {TAGL{1'b0}} : s1_tag_w[0*TAGL +: TAGL];
     assign src1_val_o[0]                = multi_fire_w ? 1'b1 : s1_val_w[0];
     assign src1_value_o[0*DW +: DW]     = multi_fire_w ? q_pc_w[0*PCW +: DW] : s1_value_w[0*DW +: DW];
@@ -540,8 +460,6 @@ module dispatcher #(
     assign imm_o[0*IMMW +: IMMW]        = q_imm_w[0*IMMW +: IMMW];
     assign pc_o[0*PCW +: PCW]           = q_pc_w[0*PCW +: PCW];
 
-    // ---- port 1 (BRANCH jump micro-op borrowing physical port1, or normal lane1 dispatch) ----
-    // PN is always > 1 in this project, so port 1 unconditionally exists.
     assign src1_tag_o[1*TAGL +: TAGL] = multi_fire_w ? s1_tag_w[0*TAGL +: TAGL]  : s1_tag_w[1*TAGL +: TAGL];
     assign src1_val_o[1]              = multi_fire_w ? s1_val_w[0]               : s1_val_w[1];
     assign src1_value_o[1*DW +: DW]   = multi_fire_w ? s1_value_w[0*DW +: DW]    : s1_value_w[1*DW +: DW];
@@ -552,7 +470,6 @@ module dispatcher #(
     assign imm_o[1*IMMW +: IMMW]      = multi_fire_w ? q_imm_w[0*IMMW +: IMMW]     : q_imm_w[1*IMMW +: IMMW];
     assign pc_o[1*PCW +: PCW]         = multi_fire_w ? q_pc_w[0*PCW +: PCW]        : q_pc_w[1*PCW +: PCW];
 
-    // ---- remaining lanes: plain pass-through ----
     generate
         for (gk = 2; gk < PN; gk = gk + 1) begin : g_normal
             assign src1_tag_o[gk*TAGL +: TAGL] = s1_tag_w[gk*TAGL +: TAGL];
@@ -567,7 +484,6 @@ module dispatcher #(
         end
     endgenerate
 
-    // ================= per-bank valid: normal grant + multi override on ports 0/1 =================
     generate
         for (gk = 0; gk < PN; gk = gk + 1) begin : g_bankvalid
             wire is_alu    = grant_w[gk] & (q_itype_w[gk*ITYPEW +: ITYPEW] == ITYPE_ALU);
@@ -588,7 +504,6 @@ module dispatcher #(
         end
     endgenerate
 
-    // ================= REGUNT0 push ports =================
     generate
         for (gk = 0; gk < PN; gk = gk + 1) begin : g_push
             if (gk == 0) begin : g_push0
@@ -604,7 +519,6 @@ module dispatcher #(
         end
     endgenerate
 
-    // ================= pop count back to instr_queue (now internal) =================
     assign q_pop_count_w = stack_count_w + multi_fire_w;
 
 endmodule

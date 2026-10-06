@@ -1,4 +1,4 @@
-`include "REGY.v"
+//`include "REGY0.v"
 // ROBY: reorder buffer with split addr+valid / data+exception memories,
 // built on top of the shared multi-port `regs` primitive.
 
@@ -6,6 +6,7 @@
 //the crash FSM has to be handled
 // Although we may be able to keep it as is, simply cuz looking at the FSM, even if we write out of range
 //nothing happens because its still out of range, and wont pop up.
+//actuallu wait, we need to allow it to write...
 module ROBY #(
     parameter S     = 32,  // number of ROB entries (power of 2)
     parameter DAT   = 32,  // data field width

@@ -1,7 +1,9 @@
-`include "REGUNT.v"
+//`include "REGUNT.v"
 // REGY0: same as REGY, but reg0 is hardwired data=0/valid=1/tag=0 and unwritable.
 // Any read at addr==0 bypasses meta storage entirely; any write/temp-tag at addr==0
 // is masked off before reaching the underlying regs primitives.
+`include "ROBY.v"
+`include "abstractions.v"
 module REGY0 #(
     parameter S    = 32,
     parameter W    = 32,
@@ -67,8 +69,8 @@ module REGY0 #(
             assign meta_raddr[(RP+wp)*ADDR +: ADDR] = WAddr[wp*ADDR +: ADDR];
             assign wr_check_tag[wp*TAGL +: TAGL] = meta_rdata[(RP+wp)*MW +: TAGL];
             assign tag_match[wp] = (wr_check_tag[wp*TAGL +: TAGL] == Wtag[wp*TAGL +: TAGL]);
-            assign we_data[wp] = We[wp] & tag_match[wp];
-            assign we_data0[wp] = we_data[wp] & (WAddr[wp*ADDR +: ADDR] != {ADDR{1'b0}});
+            assign we_data[wp] = We[wp] & tag_match[wp];// we dont really need we_data
+            assign we_data0[wp] = We[wp] & (WAddr[wp*ADDR +: ADDR] != {ADDR{1'b0}});
         end
     endgenerate
 
